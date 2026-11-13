@@ -56,12 +56,29 @@ jobs:
           docker build --target runtime -t $IMAGE:latest $APP_DIR
           docker save $IMAGE:latest | gzip > image.tar.gz
 
-      - name: Set up SSH key
+           - name: Set up SSH key
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_KEY }}
         run: |
+          [ -n "$HOST" ] || { echo "Секрет SSH_HOST пустой"; exit 1; }
+          [ -n "$PORT" ] || { echo "Секрет SSH_PORT пустой"; exit 1; }
+          [ -n "$KEY" ]  || { echo "Секрет SSH_KEY пустой"; exit 1; }
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null && echo "Ключ корректный"
+          for i in 1 2 3; do
+            ssh-keyscan -T 15 -p "$PORT" "$HOST" >> ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ] && break
+            echo "Попытка $i не удалась, жду..."; sleep 5
+          done
+          if [ ! -s ~/.ssh/known_hosts ]; then
+            echo "Не удалось подключиться к $HOST:$PORT"
+            nc -vz -w 10 "$HOST" "$PORT" || true
+            exit 1
+          fi
+          echo "Сервер доступен"
 
       - name: Copy image and deploy script to server
         run: |
