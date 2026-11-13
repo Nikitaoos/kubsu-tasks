@@ -1,0 +1,12 @@
+**/__pycache__
+**/*.pyc
+*.egg-info
+build
+.pytest_cache
+.git
+.github
+.venv
+venv
+Makefile
+deploy.sh
+README.md

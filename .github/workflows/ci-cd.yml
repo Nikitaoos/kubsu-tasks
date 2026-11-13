@@ -1,0 +1,74 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  APP_DIR: docker
+  IMAGE: kubsu-users
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: kubsu
+          POSTGRES_PASSWORD: kubsu
+          POSTGRES_DB: kubsu
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kubsu"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test image
+        run: docker build --target test -t $IMAGE:test $APP_DIR
+
+      - name: Run tests inside the built image
+        run: >
+          docker run --rm --network host
+          -e DATABASE_URL=postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu
+          $IMAGE:test
+
+      - name: Build runtime image and show its size
+        run: |
+          docker build --target runtime -t $IMAGE:latest $APP_DIR
+          docker image ls $IMAGE
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build runtime image
+        run: |
+          docker build --target runtime -t $IMAGE:latest $APP_DIR
+          docker save $IMAGE:latest | gzip > image.tar.gz
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Copy image and deploy script to server
+        run: |
+          scp -P "${{ secrets.SSH_PORT }}" image.tar.gz $APP_DIR/deploy.sh \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/"
+
+      - name: Deploy
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "APP_PORT='${{ secrets.APP_PORT }}' PATH_PREFIX='/${{ secrets.SSH_USER }}' DATABASE_URL='${{ secrets.DATABASE_URL }}' sh /tmp/deploy.sh"
