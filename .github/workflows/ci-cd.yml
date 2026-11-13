@@ -11,6 +11,7 @@ env:
   IMAGE: kubsu-users
 
 jobs:
+  # 1. Тесты: собираем образ и гоняем pytest внутри него рядом с Postgres
   test:
     runs-on: ubuntu-latest
     services:
@@ -39,12 +40,8 @@ jobs:
           -e DATABASE_URL=postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu
           $IMAGE:test
 
-      - name: Build runtime image and show its size
-        run: |
-          docker build --target runtime -t $IMAGE:latest $APP_DIR
-          docker image ls $IMAGE
-
-  deploy:
+  # 2. Сборка итогового образа и упаковка в архив (на сервере нет интернета)
+  build:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
@@ -54,38 +51,37 @@ jobs:
       - name: Build runtime image
         run: |
           docker build --target runtime -t $IMAGE:latest $APP_DIR
+          docker image ls $IMAGE
           docker save $IMAGE:latest | gzip > image.tar.gz
 
-      - name: Set up SSH key
-        env:
-          HOST: ${{ secrets.SSH_HOST }}
-          PORT: ${{ secrets.SSH_PORT }}
-          KEY: ${{ secrets.SSH_KEY }}
-        run: |
-          [ -n "$HOST" ] || { echo "Секрет SSH_HOST пустой"; exit 1; }
-          [ -n "$PORT" ] || { echo "Секрет SSH_PORT пустой"; exit 1; }
-          [ -n "$KEY" ]  || { echo "Секрет SSH_KEY пустой"; exit 1; }
-          mkdir -p ~/.ssh
-          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null && echo "Ключ корректный"
-          for i in 1 2 3; do
-            ssh-keyscan -T 15 -p "$PORT" "$HOST" >> ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ] && break
-            echo "Попытка $i не удалась, жду..."; sleep 5
-          done
-          if [ ! -s ~/.ssh/known_hosts ]; then
-            echo "Не удалось подключиться к $HOST:$PORT"
-            nc -vz -w 10 "$HOST" "$PORT" || true
-            exit 1
-          fi
-          echo "Сервер доступен"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 1
+
+  # 3. Деплой через self-hosted runner: сервер недоступен из сетей GitHub,
+  #    поэтому этот job выполняется на машине, откуда сервер виден.
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
 
       - name: Copy image and deploy script to server
+        shell: powershell
         run: |
-          scp -P "${{ secrets.SSH_PORT }}" image.tar.gz $APP_DIR/deploy.sh \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/"
+          $key = "$env:USERPROFILE\.ssh\kubsu_deploy"
+          scp -o BatchMode=yes -i $key -P "${{ secrets.SSH_PORT }}" image.tar.gz "$env:APP_DIR/deploy.sh" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Deploy
+        shell: powershell
         run: |
-          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-            "APP_PORT='${{ secrets.APP_PORT }}' PATH_PREFIX='/${{ secrets.SSH_USER }}' DATABASE_URL='${{ secrets.DATABASE_URL }}' sh /tmp/deploy.sh"
+          $key = "$env:USERPROFILE\.ssh\kubsu_deploy"
+          ssh -o BatchMode=yes -i $key -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "APP_PORT=${{ secrets.APP_PORT }} PATH_PREFIX=/${{ secrets.SSH_USER }} sh /tmp/deploy.sh"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
